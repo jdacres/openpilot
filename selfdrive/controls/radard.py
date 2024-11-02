@@ -2,7 +2,6 @@
 import importlib
 import math
 from collections import deque
-from types import SimpleNamespace
 from typing import Any
 
 import capnp
@@ -13,8 +12,9 @@ from openpilot.common.realtime import DT_CTRL, Ratekeeper, Priority, config_real
 from openpilot.common.swaglog import cloudlog
 
 from openpilot.common.simple_kalman import KF1D
+from openpilot.selfdrive.car.hyundai.values import HyundaiFlags
 
-from openpilot.selfdrive.frogpilot.frogpilot_variables import get_frogpilot_toggles
+from openpilot.selfdrive.frogpilot.frogpilot_variables import FrogPilotVariables
 
 # Default lead acceleration decay set to 50% at 1s
 _LEAD_ACCEL_TAU = 1.5
@@ -93,10 +93,11 @@ class Track:
     self.aLeadK = aLeadK
     self.aLeadTau = aLeadTau
 
-  def get_RadarState(self, model_prob: float = 0.0):
+  def get_RadarState(self, CP: car.CarParams = None, lead_msg_y: float = 0.0, model_prob: float = 0.0):
+    y_rel_vision = False if CP is None or CP.carName != "hyundai" else CP.flags & HyundaiFlags.CANFD_CAMERA_SCC
     return {
       "dRel": float(self.dRel),
-      "yRel": float(self.yRel),
+      "yRel": float(-lead_msg_y) if y_rel_vision else float(self.yRel),
       "vRel": float(self.vRel),
       "vLead": float(self.vLead),
       "vLeadK": float(self.vLeadK),
@@ -182,17 +183,17 @@ def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: floa
 
 
 def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capnp._DynamicStructReader,
-             model_v_ego: float, frogpilot_toggles: SimpleNamespace, frogpilotCarState: capnp._DynamicStructReader, low_speed_override: bool = True) -> dict[str, Any]:
+             model_v_ego: float, CP: car.CarParams,  lead_detection_threshold: float, low_speed_override: bool = True) -> dict[str, Any]:
   # Determine leads, this is where the essential logic happens
-  if len(tracks) > 0 and ready and lead_msg.prob > frogpilot_toggles.lead_detection_probability:
+  if len(tracks) > 0 and ready and lead_msg.prob > lead_detection_threshold:
     track = match_vision_to_track(v_ego, lead_msg, tracks)
   else:
     track = None
 
   lead_dict = {'status': False}
   if track is not None:
-    lead_dict = track.get_RadarState(lead_msg.prob)
-  elif (track is None) and ready and (lead_msg.prob > frogpilot_toggles.lead_detection_probability):
+    lead_dict = track.get_RadarState(CP, lead_msg.y[0], lead_msg.prob)
+  elif (track is None) and ready and (lead_msg.prob > lead_detection_threshold):
     lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego)
 
   if low_speed_override:
@@ -203,9 +204,6 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
       # Only choose new track if it is actually closer than the previous one
       if (not lead_dict['status']) or (closest_track.dRel < lead_dict['dRel']):
         lead_dict = closest_track.get_RadarState()
-
-  if 'dRel' in lead_dict:
-    lead_dict['dRel'] -= max(frogpilot_toggles.increased_stopped_distance + min(10 - v_ego, 0), 0) if not frogpilotCarState.trafficModeActive else 0
 
   return lead_dict
 
@@ -222,7 +220,7 @@ def get_lead_adjacent(tracks: dict[int, Track], model_data: capnp._DynamicStruct
 
 
 class RadarD:
-  def __init__(self, frogpilot_toggles, radar_ts: float, delay: int = 0):
+  def __init__(self, radar_ts: float, CP: car.CarParams, delay: int = 0):
     self.points: dict[int, tuple[float, float, float]] = {}
 
     self.current_time = 0.0
@@ -240,10 +238,15 @@ class RadarD:
 
     self.ready = False
 
+    self.CP = CP
+    
     # FrogPilot variables
-    self.frogpilot_toggles = frogpilot_toggles
+    self.frogpilot_toggles = FrogPilotVariables.toggles
+    FrogPilotVariables.update_frogpilot_params()
 
-    self.classic_model = self.frogpilot_toggles.classic_model
+    self.velocity_model = self.frogpilot_toggles.velocity_model
+
+    self.update_toggles = False
 
   def update(self, sm: messaging.SubMaster, rr):
     self.ready = sm.seen['modelV2']
@@ -288,26 +291,29 @@ class RadarD:
     self.radar_state.radarErrors = list(radar_errors)
     self.radar_state.carStateMonoTime = sm.logMonoTime['carState']
 
-    if self.classic_model and len(sm['modelV2'].temporalPose.trans):
-      model_v_ego = sm['modelV2'].temporalPose.trans[0]
-    elif len(sm['modelV2'].velocity.x):
+    if self.velocity_model and len(sm['modelV2'].velocity.x):
       model_v_ego = sm['modelV2'].velocity.x[0]
+    elif len(sm['modelV2'].temporalPose.trans):
+      model_v_ego = sm['modelV2'].temporalPose.trans[0]
     else:
       model_v_ego = self.v_ego
     leads_v3 = sm['modelV2'].leadsV3
     if len(leads_v3) > 1:
-      self.radar_state.leadOne = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego, self.frogpilot_toggles, sm['frogpilotCarState'], low_speed_override=True)
-      self.radar_state.leadTwo = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego, self.frogpilot_toggles, sm['frogpilotCarState'], low_speed_override=False)
+      self.radar_state.leadOne = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego, self.CP, self.frogpilot_toggles.lead_detection_threshold, low_speed_override=True)
+      self.radar_state.leadTwo = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego, self.CP, self.frogpilot_toggles.lead_detection_threshold, low_speed_override=False)
 
-    if self.frogpilot_toggles.adjacent_lead_tracking and self.ready:
+    if self.frogpilot_toggles.adjacent_lead_tracking_ui:
       self.radar_state.leadLeft = get_lead_adjacent(self.tracks, sm['modelV2'], sm['frogpilotPlan'].laneWidthLeft, left=True)
       self.radar_state.leadLeftFar = get_lead_adjacent(self.tracks, sm['modelV2'], sm['frogpilotPlan'].laneWidthLeft, left=True, far=True)
       self.radar_state.leadRight = get_lead_adjacent(self.tracks, sm['modelV2'], sm['frogpilotPlan'].laneWidthRight, left=False)
       self.radar_state.leadRightFar = get_lead_adjacent(self.tracks, sm['modelV2'], sm['frogpilotPlan'].laneWidthRight, left=False, far=True)
 
     # Update FrogPilot parameters
-    if sm['frogpilotPlan'].togglesUpdated:
-      self.frogpilot_toggles = get_frogpilot_toggles()
+    if FrogPilotVariables.toggles_updated:
+      self.update_toggles = True
+    elif self.update_toggles:
+      FrogPilotVariables.update_frogpilot_params()
+      self.update_toggles = False
 
   def publish(self, pm: messaging.PubMaster, lag_ms: float):
     assert self.radar_state is not None
@@ -376,14 +382,14 @@ def main():
   RI = RadarInterface(CP)
 
   rk = Ratekeeper(1.0 / CP.radarTimeStep, print_delay_threshold=None)
+  RD = RadarD(CP.radarTimeStep, CP, RI.delay)
 
   # FrogPilot variables
-  frogpilot_toggles = get_frogpilot_toggles(True)
-
-  RD = RadarD(frogpilot_toggles, CP.radarTimeStep, RI.delay)
+  frogpilot_toggles = FrogPilotVariables.toggles
+  FrogPilotVariables.update_frogpilot_params()
 
   if not frogpilot_toggles.radarless_model:
-    sm = messaging.SubMaster(['modelV2', 'carState', 'frogpilotCarState', 'frogpilotPlan'], frequency=int(1./DT_CTRL))
+    sm = messaging.SubMaster(['modelV2', 'carState', 'frogpilotPlan'], frequency=int(1./DT_CTRL))
     pm = messaging.PubMaster(['radarState', 'liveTracks'])
     while 1:
       can_strings = messaging.drain_sock_raw(can_sock, wait_for_one=True)
